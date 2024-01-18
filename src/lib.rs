@@ -4,7 +4,6 @@ mod display_info;
 mod window_info;
 
 use ndarray::Array3;
-use static_init::dynamic;
 use windows::core::{ComInterface, IInspectable};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
@@ -24,30 +23,148 @@ use windows::Win32::System::WinRT::{
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
 use capture::enumerate_capturable_windows;
-use display_info::enumerate_displays;
 use std::sync::mpsc::{channel, Receiver};
 use thiserror::Error;
 use window_info::WindowInfo;
 
 use windows::core::Error as WindowsError;
 
-#[dynamic]
-static mut RECEIVER: Option<Receiver<Direct3D11CaptureFrame>> = None;
+pub struct Recorder {
+    receiver: Receiver<Direct3D11CaptureFrame>,
+    frame_pool: Direct3D11CaptureFramePool,
+    capture_session: GraphicsCaptureSession,
+    d3d_context: ID3D11DeviceContext,
+    d3d_device: ID3D11Device,
+}
 
-#[dynamic]
-static mut FRAME_POOL: Option<Direct3D11CaptureFramePool> = None;
+pub struct Window {
+    recorded_item: GraphicsCaptureItem,
+}
 
-#[dynamic]
-static mut CAPTURE_SESSION: Option<GraphicsCaptureSession> = None;
+impl Window {
+    pub fn new_from_name(window_name: String) -> Result<Self, SourceSelectionErr> {
+        let window = get_window_from_query(&window_name)?;
 
-#[dynamic]
-static mut D3D_DEVICE: Option<ID3D11Device> = None;
+        Ok(Window {
+            recorded_item: create_capture_item_for_window(window.handle)?,
+        })
+    }
+    pub fn create_record(&self) -> Result<Recorder, InitializeErr> {
+        unsafe {
+            RoInitialize(RO_INIT_MULTITHREADED)?;
+        }
+        let item_size = self.recorded_item.Size()?;
+        let d3d_device = d3d::create_d3d_device()?;
+        let d3d_context = unsafe { d3d_device.GetImmediateContext()? };
+        let device = d3d::create_direct3d_device(&d3d_device)?;
+        let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            1,
+            item_size,
+        )?;
+        let capture_session = frame_pool.CreateCaptureSession(&self.recorded_item)?;
+        let (sender, receiver) = channel();
 
-#[dynamic]
-static mut D3D_CONTEXT: Option<ID3D11DeviceContext> = None;
+        //continuously get frames on seperate thread
+        frame_pool.FrameArrived(
+            &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new({
+                move |frame_pool: &Option<Direct3D11CaptureFramePool>,
+                      _|
+                      -> windows::core::Result<()> {
+                    let frame_pool = frame_pool.as_ref().unwrap();
+                    let frame = frame_pool.TryGetNextFrame()?;
+                    sender.send(frame).unwrap();
+                    Ok(())
+                }
+            }),
+        )?;
+        capture_session.StartCapture()?;
 
-#[dynamic]
-static mut RECORDED_ITEM: Option<GraphicsCaptureItem> = None;
+        //store initialized items to be used.
+        Ok(Recorder {
+            receiver,
+            frame_pool,
+            capture_session,
+            d3d_context,
+            d3d_device,
+        })
+    }
+}
+
+impl Recorder {
+    fn get_texture(&self) -> Result<ID3D11Texture2D, TextureErr> {
+        //get next frame from the capture thread
+        let frame = self.receiver.recv()?;
+
+        let source_texture: ID3D11Texture2D =
+            d3d::get_d3d_interface_from_object(&frame.Surface()?)?;
+
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { source_texture.GetDesc(&mut desc) };
+        desc.BindFlags = D3D11_BIND_FLAG(0);
+        desc.MiscFlags = D3D11_RESOURCE_MISC_FLAG(0);
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        let copy_texture = {
+            let mut texture = None;
+            unsafe {
+                self.d3d_device
+                    .CreateTexture2D(&desc, None, Some(&mut texture))
+            }?;
+            texture.unwrap()
+        };
+
+        unsafe {
+            self.d3d_context
+                .CopyResource(Some(&copy_texture.cast()?), Some(&source_texture.cast()?));
+        }
+
+        Ok(copy_texture)
+    }
+    pub fn get_image(&self) -> Result<Array3<u8>, GetBitsErr> {
+        let texture = self.get_texture()?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc as *mut _) };
+
+        let resource: ID3D11Resource = texture.cast()?;
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.d3d_context.Map(
+                Some(&resource.clone()),
+                0,
+                D3D11_MAP_READ,
+                0,
+                Some(&mut mapped),
+            )
+        }?;
+
+        let slice: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                mapped.pData as *const _,
+                (desc.Height * mapped.RowPitch) as usize,
+            )
+        };
+
+        unsafe { self.d3d_context.Unmap(Some(&resource), 0) };
+
+        Ok(ndarray::arr1(slice)
+            .to_shape((desc.Height as usize, desc.Width as usize, 4))
+            .unwrap()
+            .to_owned())
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        self.capture_session
+            .Close()
+            .expect("Capture Session already closed?");
+        self.frame_pool.Close().expect("Frame pool already closed?");
+    }
+}
 
 //error type if any static is not initialized, but attempted to be used
 
@@ -96,7 +213,7 @@ pub enum SourceSelectionErr {
     WindowsError(#[from] WindowsError),
 }
 
-pub fn select_monitor(monitor_id: usize) -> Result<(), SourceSelectionErr> {
+/*pub fn select_monitor(monitor_id: usize) -> Result<(), SourceSelectionErr> {
     let displays = enumerate_displays()?;
     if monitor_id >= displays.len() {
         return Err(SourceSelectionErr::MonitorOutOfRange {
@@ -119,7 +236,7 @@ pub fn select_window_by_pid(pid: u32) -> Result<(), SourceSelectionErr> {
     let window = get_window_by_pid(pid).ok_or(SourceSelectionErr::NoWindowWithPid(pid))?;
     *RECORDED_ITEM.write() = Some(create_capture_item_for_window(window.handle)?);
     Ok(())
-}
+}*/
 
 #[derive(Debug, Error)]
 pub enum CloseCaptureError {
@@ -129,24 +246,6 @@ pub enum CloseCaptureError {
     WindowsError(#[from] WindowsError),
 }
 ///close all handles and set all static variables to None, needs to be reinitialized
-pub fn close_capture() -> Result<(), CloseCaptureError> {
-    CAPTURE_SESSION
-        .read()
-        .as_ref()
-        .ok_or(NonInitializedErr::CaptureSession)?
-        .Close()?;
-    FRAME_POOL
-        .read()
-        .as_ref()
-        .ok_or(NonInitializedErr::FramePool)?
-        .Close()?;
-    *FRAME_POOL.write() = None;
-    *CAPTURE_SESSION.write() = None;
-    *D3D_CONTEXT.write() = None;
-    *D3D_DEVICE.write() = None;
-    *RECEIVER.write() = None;
-    Ok(())
-}
 
 #[derive(Error, Debug)]
 pub enum InitializeErr {
@@ -154,51 +253,6 @@ pub enum InitializeErr {
     WindowsError(#[from] WindowsError),
     #[error(transparent)]
     NonInitialized(#[from] NonInitializedErr),
-}
-
-pub fn initialize_capture() -> Result<(), InitializeErr> {
-    unsafe {
-        RoInitialize(RO_INIT_MULTITHREADED)?;
-    }
-    let item = RECORDED_ITEM
-        .read()
-        .as_ref()
-        .ok_or(NonInitializedErr::RecordedItem)?
-        .clone();
-
-    let item_size = item.Size()?;
-    let d3d_device = d3d::create_d3d_device()?;
-    let d3d_context = unsafe { d3d_device.GetImmediateContext()? };
-    let device = d3d::create_direct3d_device(&d3d_device)?;
-    let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &device,
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        1,
-        item_size,
-    )?;
-    let session = frame_pool.CreateCaptureSession(&item)?;
-    let (sender, receiver) = channel();
-
-    //continuously get frames on seperate thread
-    frame_pool.FrameArrived(
-        &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new({
-            move |frame_pool: &Option<Direct3D11CaptureFramePool>, _| -> windows::core::Result<()> {
-                let frame_pool = frame_pool.as_ref().unwrap();
-                let frame = frame_pool.TryGetNextFrame()?;
-                sender.send(frame).unwrap();
-                Ok(())
-            }
-        }),
-    )?;
-    session.StartCapture()?;
-
-    //store initialized items to be used.
-    *RECEIVER.write() = Some(receiver);
-    *D3D_CONTEXT.write() = Some(d3d_context);
-    *D3D_DEVICE.write() = Some(d3d_device);
-    *FRAME_POOL.write() = Some(frame_pool);
-    *CAPTURE_SESSION.write() = Some(session);
-    Ok(())
 }
 
 #[derive(Error, Debug)]
@@ -211,94 +265,14 @@ pub enum TextureErr {
     ChannelError(#[from] std::sync::mpsc::RecvError),
 }
 
-fn get_texture() -> Result<ID3D11Texture2D, TextureErr> {
-    //get next frame from the capture thread
-    let frame = RECEIVER
-        .read()
-        .as_ref()
-        .ok_or(NonInitializedErr::Receiver)?
-        .recv()?;
-
-    let source_texture: ID3D11Texture2D = d3d::get_d3d_interface_from_object(&frame.Surface()?)?;
-
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe { source_texture.GetDesc(&mut desc) };
-    desc.BindFlags = D3D11_BIND_FLAG(0);
-    desc.MiscFlags = D3D11_RESOURCE_MISC_FLAG(0);
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-    let copy_texture = {
-        let mut texture = None;
-        unsafe {
-            D3D_DEVICE
-                .read()
-                .as_ref()
-                .ok_or(NonInitializedErr::D3DDevice)?
-                .CreateTexture2D(&desc, None, Some(&mut texture))
-        }?;
-        texture.unwrap()
-    };
-
-    unsafe {
-        D3D_CONTEXT
-            .read()
-            .as_ref()
-            .ok_or(NonInitializedErr::D3DContext)?
-            .CopyResource(Some(&copy_texture.cast()?), Some(&source_texture.cast()?));
-    }
-
-    Ok(copy_texture)
-}
 #[derive(Error, Debug)]
 pub enum GetBitsErr {
     #[error(transparent)]
     WindowsError(#[from] WindowsError),
     #[error(transparent)]
     NonInitialized(#[from] NonInitializedErr),
-}
-
-
-fn get_image(texture: ID3D11Texture2D) -> Result<Array3<u8>, GetBitsErr> {
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe { texture.GetDesc(&mut desc as *mut _) };
-
-    let resource: ID3D11Resource = texture.cast()?;
-    
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe {
-        D3D_CONTEXT
-            .read()
-            .as_ref()
-            .ok_or(NonInitializedErr::D3DContext)?
-            .Map(
-                Some(&resource.clone()),
-                0,
-                D3D11_MAP_READ,
-                0,
-                Some(&mut mapped),
-            )
-    }?;
-
-    let slice: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            mapped.pData as *const _,
-            (desc.Height * mapped.RowPitch) as usize,
-        )
-    };
-
-    unsafe {
-        D3D_CONTEXT
-            .read()
-            .as_ref()
-            .ok_or(NonInitializedErr::D3DContext)?
-            .Unmap(Some(&resource), 0)
-    };
-
-    Ok(ndarray::arr1(slice)
-        .to_shape((desc.Height as usize, desc.Width as usize, 4))
-        .unwrap()
-        .to_owned())
+    #[error(transparent)]
+    TextureErr(#[from] TextureErr),
 }
 
 #[derive(Debug, Error)]
@@ -307,11 +281,6 @@ pub enum ScreenshotErr {
     TextureErr(#[from] TextureErr),
     #[error(transparent)]
     BitsErr(#[from] GetBitsErr),
-}
-
-pub fn take_screenshot() -> Result<Array3<u8>, ScreenshotErr> {
-    let texture = get_texture()?;
-    Ok(get_image(texture)?)
 }
 
 #[derive(Debug, Error)]
