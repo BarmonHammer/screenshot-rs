@@ -3,7 +3,8 @@ mod d3d;
 mod display_info;
 mod window_info;
 
-use ndarray::Array3;
+use ndarray::prelude::*;
+use ndarray::{Array3, ArrayBase, OwnedRepr, ShapeError};
 use windows::core::{ComInterface, IInspectable};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
@@ -49,7 +50,7 @@ impl Window {
             recorded_item: create_capture_item_for_window(window.handle)?,
         })
     }
-    pub fn create_record(&self) -> Result<Recorder, InitializeErr> {
+    pub fn create_record(&self) -> Result<Recorder, WindowsError> {
         unsafe {
             RoInitialize(RO_INIT_MULTITHREADED)?;
         }
@@ -79,6 +80,7 @@ impl Window {
                 }
             }),
         )?;
+        capture_session.SetIsBorderRequired(false)?;
         capture_session.StartCapture()?;
 
         //store initialized items to be used.
@@ -147,13 +149,17 @@ impl Recorder {
                 (desc.Height * mapped.RowPitch) as usize,
             )
         };
+        
+        let vec: Vec<u8> = Vec::from(slice);
 
         unsafe { self.d3d_context.Unmap(Some(&resource), 0) };
 
-        Ok(ndarray::arr1(slice)
-            .to_shape((desc.Height as usize, desc.Width as usize, 4))
-            .unwrap()
-            .to_owned())
+        let ndarray: ArrayBase<OwnedRepr<u8>, Dim<[usize; 3]>> =
+            ndarray::ArrayBase::from_shape_vec(
+                (desc.Height as usize, desc.Width as usize, 4),
+                vec,
+            )?;
+        Ok(ndarray)
     }
 }
 
@@ -164,24 +170,6 @@ impl Drop for Recorder {
             .expect("Capture Session already closed?");
         self.frame_pool.Close().expect("Frame pool already closed?");
     }
-}
-
-//error type if any static is not initialized, but attempted to be used
-
-#[derive(Error, Debug)]
-pub enum NonInitializedErr {
-    #[error("receiver not initialized")]
-    Receiver,
-    #[error("frame pool not initialized")]
-    FramePool,
-    #[error("capture session not initialized")]
-    CaptureSession,
-    #[error("D3D context not initialized")]
-    D3DContext,
-    #[error("D3D device not initialized")]
-    D3DDevice,
-    #[error("no selected item to record")]
-    RecordedItem,
 }
 
 fn create_capture_item_for_window(
@@ -238,27 +226,8 @@ pub fn select_window_by_pid(pid: u32) -> Result<(), SourceSelectionErr> {
     Ok(())
 }*/
 
-#[derive(Debug, Error)]
-pub enum CloseCaptureError {
-    #[error(transparent)]
-    NonInitialized(#[from] NonInitializedErr),
-    #[error(transparent)]
-    WindowsError(#[from] WindowsError),
-}
-///close all handles and set all static variables to None, needs to be reinitialized
-
-#[derive(Error, Debug)]
-pub enum InitializeErr {
-    #[error(transparent)]
-    WindowsError(#[from] WindowsError),
-    #[error(transparent)]
-    NonInitialized(#[from] NonInitializedErr),
-}
-
 #[derive(Error, Debug)]
 pub enum TextureErr {
-    #[error(transparent)]
-    NonInitialized(#[from] NonInitializedErr),
     #[error(transparent)]
     WindowsError(#[from] WindowsError),
     #[error(transparent)]
@@ -270,9 +239,9 @@ pub enum GetBitsErr {
     #[error(transparent)]
     WindowsError(#[from] WindowsError),
     #[error(transparent)]
-    NonInitialized(#[from] NonInitializedErr),
-    #[error(transparent)]
     TextureErr(#[from] TextureErr),
+    #[error(transparent)]
+    ShapeErr(#[from] ShapeError),
 }
 
 #[derive(Debug, Error)]
@@ -294,7 +263,7 @@ pub enum WindowSelectionErr {
 }
 
 fn get_window_from_query(query: &str) -> Result<WindowInfo, WindowSelectionErr> {
-    let windows = find_window_by_name(query);
+    let windows = find_windows_by_name(query);
 
     //if no windows match return error
     if windows.len() == 0 {
@@ -315,7 +284,7 @@ fn get_window_from_query(query: &str) -> Result<WindowInfo, WindowSelectionErr> 
     Ok(windows[0].clone())
 }
 
-fn find_window_by_name(window_name: &str) -> Vec<WindowInfo> {
+fn find_windows_by_name(window_name: &str) -> Vec<WindowInfo> {
     let window_list = enumerate_capturable_windows();
     let mut windows: Vec<WindowInfo> = Vec::new();
     for window_info in window_list.into_iter() {
