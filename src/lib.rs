@@ -28,6 +28,8 @@ use std::sync::mpsc::{channel, Receiver};
 use thiserror::Error;
 use window_info::WindowInfo;
 
+#[cfg(feature = "opencv")]
+use opencv::prelude::*;
 use windows::core::Error as WindowsError;
 
 pub struct Recorder {
@@ -126,6 +128,24 @@ impl Recorder {
         Ok(copy_texture)
     }
     pub fn get_image(&self) -> Result<Array3<u8>, GetBitsErr> {
+        let (vec, width, height) = self.get_vec()?;
+        let ndarray: ArrayBase<OwnedRepr<u8>, Dim<[usize; 3]>> =
+            ndarray::ArrayBase::from_shape_vec((height as usize, width as usize, 4), vec)?;
+        Ok(ndarray)
+    }
+
+    #[cfg(feature = "opencv")]
+    pub fn get_cvmat(&self) -> Result<Mat, CVBitsErr> {
+        let (vec, width, height) = self.get_vec()?;
+        Ok(Mat::from_slice_rows_cols(
+            vec.as_slice(),
+            width as usize,
+            height as usize,
+        )?)
+    }
+
+    /// Returns Vec with Width and Height
+    pub fn get_vec(&self) -> Result<(Vec<u8>, u32, u32), GetBitsErr> {
         let texture = self.get_texture()?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc as *mut _) };
@@ -149,17 +169,12 @@ impl Recorder {
                 (desc.Height * mapped.RowPitch) as usize,
             )
         };
-        
+
         let vec: Vec<u8> = Vec::from(slice);
 
         unsafe { self.d3d_context.Unmap(Some(&resource), 0) };
 
-        let ndarray: ArrayBase<OwnedRepr<u8>, Dim<[usize; 3]>> =
-            ndarray::ArrayBase::from_shape_vec(
-                (desc.Height as usize, desc.Width as usize, 4),
-                vec,
-            )?;
-        Ok(ndarray)
+        Ok((vec, desc.Width, desc.Height))
     }
 }
 
@@ -184,21 +199,6 @@ fn create_capture_item_for_monitor(
 ) -> windows::core::Result<GraphicsCaptureItem> {
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     unsafe { interop.CreateForMonitor(monitor_handle) }
-}
-
-#[derive(Error, Debug)]
-pub enum SourceSelectionErr {
-    #[error("monitor {} was selected, but max monitor id is {}", .selected_monitor, .max_id)]
-    MonitorOutOfRange {
-        selected_monitor: usize,
-        max_id: usize,
-    },
-    #[error("no window with pid {} exists", .0)]
-    NoWindowWithPid(u32),
-    #[error(transparent)]
-    WindowSelectionError(#[from] WindowSelectionErr),
-    #[error(transparent)]
-    WindowsError(#[from] WindowsError),
 }
 
 /*pub fn select_monitor(monitor_id: usize) -> Result<(), SourceSelectionErr> {
@@ -227,6 +227,21 @@ pub fn select_window_by_pid(pid: u32) -> Result<(), SourceSelectionErr> {
 }*/
 
 #[derive(Error, Debug)]
+pub enum SourceSelectionErr {
+    #[error("monitor {} was selected, but max monitor id is {}", .selected_monitor, .max_id)]
+    MonitorOutOfRange {
+        selected_monitor: usize,
+        max_id: usize,
+    },
+    #[error("no window with pid {} exists", .0)]
+    NoWindowWithPid(u32),
+    #[error(transparent)]
+    WindowSelectionError(#[from] WindowSelectionErr),
+    #[error(transparent)]
+    WindowsError(#[from] WindowsError),
+}
+
+#[derive(Error, Debug)]
 pub enum TextureErr {
     #[error(transparent)]
     WindowsError(#[from] WindowsError),
@@ -242,6 +257,15 @@ pub enum GetBitsErr {
     TextureErr(#[from] TextureErr),
     #[error(transparent)]
     ShapeErr(#[from] ShapeError),
+}
+
+#[cfg(feature = "opencv")]
+#[derive(Error, Debug)]
+pub enum CVBitsErr {
+    #[error(transparent)]
+    BitsErr(#[from] GetBitsErr),
+    #[error(transparent)]
+    OpenCV(#[from] opencv::Error),
 }
 
 #[derive(Debug, Error)]
